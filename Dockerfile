@@ -22,14 +22,19 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /build
 
 # Dependency layer first so source edits do not re-resolve the whole tree.
+#
+# `id=` is required by Railway's builder and optional for plain BuildKit, which
+# defaults it to the target path. Omitting it built fine locally and failed on
+# Railway with "flag '--mount=type=cache,...' is missing an id argument" — so
+# keep the id even though a local `docker build` does not need it.
 COPY pyproject.toml ./
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv sync --no-dev --no-install-project
 
 # Then the project itself.
 COPY README.md ./
 COPY app ./app
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv sync --no-dev
 
 # For byte-reproducible builds: commit uv.lock, add it to the COPY above, and swap both
