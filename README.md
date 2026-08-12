@@ -85,6 +85,35 @@ Run the suite with `PYTHONPATH=. pytest tests` (190 tests, no network required).
 
 ---
 
+## Process model — and why the Procfile has no comments in it
+
+Both processes run in ONE Railway service, supervised by honcho (see the
+`Procfile` and the Dockerfile `CMD`).
+
+**Keep the Procfile to exactly two lines.** Railway parses it and creates one
+service per line — *including comment lines*. A Procfile with an explanatory
+header produced five services on first deploy: `api`, `worker`, and three named
+after comment fragments (`# The cost of that choice`, and friends), all of which
+failed to build. That is why the reasoning lives here instead.
+
+**Why one service and not two.** Splitting api and worker would be the textbook
+answer — independent scaling, and a worker OOM would not take the API down. It
+does not work here: the worker writes the muxed file to disk and the job-status
+path reads it back before it goes to R2, and a Railway volume attaches to
+exactly one service. Two services means two disjoint filesystems, so the handoff
+would have to round-trip through R2 even for files about to be deleted — extra
+egress, extra latency, extra failure mode.
+
+**The cost of that choice.** honcho exits when any child exits, taking the API
+down with a crashed worker. That is intentional: Railway's restart policy then
+restarts the whole thing, and a half-dead service accepting jobs it will never
+run is worse than a brief 502.
+
+**`--proxy-headers --forwarded-allow-ips='*'`.** Railway and Cloudflare both sit
+in front, and the quota/ticket `ip_hash` values are worthless if every request
+looks like it came from the edge. Trusting `*` is only safe because nothing but
+the platform proxy can reach this port.
+
 ## Deploying to Railway
 
 **1. Create a NEW Railway project.** Not a service inside the portfolio project — a new project,
