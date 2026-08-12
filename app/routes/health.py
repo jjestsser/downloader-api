@@ -34,6 +34,7 @@ from redis.exceptions import RedisError
 from app.logging_conf import log
 from app.redis_conn import get_redis, ping
 from app.settings import settings
+from app.storage import r2
 
 router = APIRouter(tags=["ops"])
 
@@ -205,6 +206,36 @@ async def healthz() -> JSONResponse:
     return JSONResponse({"status": "ok", "uptime_s": round(time.time() - _PROCESS_START, 1)})
 
 
+#: R2 readiness is cached: /readyz is polled by the platform, and a HeadBucket on
+#: every poll is a needless round trip to Cloudflare. Short enough that a fixed
+#: bucket shows up within a minute of the fix.
+_R2_PROBE_TTL_S: Final[int] = 30
+_r2_probe: dict[str, Any] = {"at": 0.0, "ok": False}
+
+
+async def _r2_ready() -> str:
+    """Actually talk to the bucket, rather than counting non-empty env vars.
+
+    This reported "configured" while every worker job died on upload. Four
+    populated environment variables say nothing about whether the credentials are
+    valid, the bucket exists, or the endpoint is reachable — and the one thing
+    that does say so, `r2.health()`, was already written here and never called.
+    A readiness probe that cannot fail is not a probe.
+
+    Deliberately NOT part of the 503 decision. R2 is only needed by the worker
+    path; `/v1/resolve` and every direct-CDN handoff work without it, so a bucket
+    outage should degrade this service, not remove it from rotation.
+    """
+    if not settings.r2_configured:
+        return "unconfigured"
+
+    now = time.time()
+    if now - _r2_probe["at"] > _R2_PROBE_TTL_S:
+        _r2_probe["ok"] = await r2.health()
+        _r2_probe["at"] = now
+    return "up" if _r2_probe["ok"] else "down"
+
+
 @router.get("/readyz", include_in_schema=False)
 async def readyz() -> JSONResponse:
     """Readiness: 503 while Redis is unreachable, because nothing works without it."""
@@ -212,7 +243,7 @@ async def readyz() -> JSONResponse:
     payload: dict[str, Any] = {
         "status": "ready" if redis_ok else "not_ready",
         "redis": "up" if redis_ok else "down",
-        "r2": "configured" if settings.r2_configured else "unconfigured",
+        "r2": await _r2_ready(),
         "env": settings.environment,
     }
     status_code = 200 if redis_ok else 503

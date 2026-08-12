@@ -80,6 +80,35 @@ def _content_type_for(key: str) -> str:
     return guessed or "application/octet-stream"
 
 
+def _describe(exc: Exception) -> str:
+    """A log-safe summary of an S3 failure that says which one it was.
+
+    Logging only `type(exc).__name__` is what made this undiagnosable: botocore
+    raises `ClientError` for a missing bucket, wrong credentials, a signature
+    mismatch and a permissions denial alike, so the type alone rules nothing out.
+    The S3 error code and HTTP status do distinguish them — `NoSuchBucket` versus
+    `InvalidAccessKeyId` versus `SignatureDoesNotMatch` — and neither contains a
+    secret.
+
+    The bucket and endpoint are included because the most common cause is that
+    one of them is simply wrong, and comparing them against the dashboard is a
+    two-second check that is impossible without seeing what the service used.
+    """
+    parts = [type(exc).__name__]
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error", {})
+        code = error.get("Code")
+        if code:
+            parts.append(f"code={code}")
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status:
+            parts.append(f"http={status}")
+    parts.append(f"bucket={settings.r2_bucket!r}")
+    parts.append(f"endpoint={_endpoint_url()}")
+    return " ".join(parts)
+
+
 async def upload(local_path: str | Path, key: str) -> None:
     """Upload a finished render to R2 under `key`.
 
@@ -101,8 +130,23 @@ async def upload(local_path: str | Path, key: str) -> None:
         "CacheControl": "private, max-age=0, no-store",
     }
 
-    async with _session.client("s3", **_client_kwargs()) as s3:  # type: ignore[call-overload]
-        await s3.upload_file(str(path), settings.r2_bucket, key, ExtraArgs=extra)
+    try:
+        async with _session.client("s3", **_client_kwargs()) as s3:  # type: ignore[call-overload]
+            await s3.upload_file(str(path), settings.r2_bucket, key, ExtraArgs=extra)
+    except Exception as exc:  # noqa: BLE001 - see below; every failure here is ours
+        # Translated rather than allowed to escape, because the job's outermost
+        # handler turns anything unrecognised into `internal` — the same code a
+        # genuine crash produces. A wrong bucket name and a null-pointer bug then
+        # look identical from the outside, which is exactly how a misconfigured
+        # bucket survived a full debugging session.
+        #
+        # `_describe` is logged, never returned: it names the bucket and endpoint,
+        # which are ours to know and not the caller's.
+        log.error(
+            "r2.upload_failed",
+            extra={"key": key, "bytes": size, "error": _describe(exc)},
+        )
+        raise ApiError("storage_failed", detail="Could not store the finished file.") from exc
 
     log.info("r2.upload_ok", extra={"key": key, "bytes": size})
 
@@ -151,5 +195,5 @@ async def health() -> bool:
             await asyncio.wait_for(s3.head_bucket(Bucket=settings.r2_bucket), timeout=5)
         return True
     except Exception as exc:  # noqa: BLE001
-        log.warning("r2.health_failed", extra={"error": type(exc).__name__})
+        log.warning("r2.health_failed", extra={"error": _describe(exc)})
         return False

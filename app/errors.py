@@ -31,6 +31,13 @@ ERROR_CODES: Final[dict[str, int]] = {
     "extractor_failed": 502,
     "platform_degraded": 503,
     "job_not_found": 404,
+    # Distinct from `internal` because it points at a different thing to fix. The
+    # download itself succeeded and the bytes are on disk; only the handoff to R2
+    # failed, which is almost always credentials, bucket name or endpoint. Folding
+    # it into `internal` meant a misconfigured bucket and a genuine crash were
+    # indistinguishable from outside, and `/readyz` reported "r2: configured"
+    # for both because it only checked that four env vars were non-empty.
+    "storage_failed": 502,
     "internal": 500,
     # Framework-level failures. These are raised by main.py's handlers rather
     # than by business logic, but they must live here: the front-end switches on
@@ -60,6 +67,7 @@ DEFAULT_DETAIL: Final[dict[str, str]] = {
     "extractor_failed": "Could not read that link. The post may be private, deleted or region-locked.",
     "platform_degraded": "That platform is temporarily unavailable. Please try again later.",
     "job_not_found": "That download job does not exist or has expired.",
+    "storage_failed": "We fetched your file but could not store it. This is our fault, not your link.",
     "internal": "Something went wrong on our side.",
     "invalid_request": "That request was not in a form this service understands.",
     "not_found": "There is nothing at this address.",
