@@ -59,7 +59,7 @@ class _ClientError(Exception):
 def _clear_probe_cache() -> None:
     """The probe caches for 30s; tests must not inherit each other's verdict."""
     health._r2_probe["at"] = 0.0
-    health._r2_probe["ok"] = False
+    health._r2_probe["why"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -71,17 +71,17 @@ async def test_readyz_reports_r2_down_when_the_bucket_is_unreachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The regression, exactly: env vars all set, bucket broken."""
-    monkeypatch.setattr(r2, "health", lambda: _false())
+    monkeypatch.setattr(r2, "health", lambda: _broken())
 
-    assert await health._r2_ready() == "down"
+    assert (await health._r2_ready())[0] == "down"
 
 
 async def test_readyz_reports_r2_up_when_the_bucket_answers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(r2, "health", lambda: _true())
+    monkeypatch.setattr(r2, "health", lambda: _healthy())
 
-    assert await health._r2_ready() == "up"
+    assert (await health._r2_ready())[0] == "up"
 
 
 async def test_readyz_never_reports_the_old_configured_string(
@@ -92,36 +92,36 @@ async def test_readyz_never_reports_the_old_configured_string(
     Asserted as a literal because the failure mode is someone reintroducing the
     cheap check for being cheap, and every other assertion here would still pass.
     """
-    monkeypatch.setattr(r2, "health", lambda: _true())
+    monkeypatch.setattr(r2, "health", lambda: _healthy())
 
-    assert await health._r2_ready() != "configured"
+    assert (await health._r2_ready())[0] != "configured"
 
 
 async def test_r2_probe_is_cached_between_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """/readyz is polled by the platform; one HeadBucket per poll is waste."""
     calls = {"n": 0}
 
-    async def counting() -> bool:
+    async def counting() -> str | None:
         calls["n"] += 1
-        return True
+        return None
 
     monkeypatch.setattr(r2, "health", counting)
 
     for _ in range(5):
-        assert await health._r2_ready() == "up"
+        assert (await health._r2_ready())[0] == "up"
     assert calls["n"] == 1
 
 
 async def test_unconfigured_r2_is_not_probed(monkeypatch: pytest.MonkeyPatch) -> None:
     """No credentials is a different state from bad credentials, and is not an error."""
 
-    async def explode() -> bool:  # pragma: no cover - must never run
+    async def explode() -> str | None:  # pragma: no cover - must never run
         raise AssertionError("probed R2 with no credentials configured")
 
     monkeypatch.setattr(r2, "health", explode)
     monkeypatch.setattr(type(r2.settings), "r2_configured", property(lambda _: False))
 
-    assert await health._r2_ready() == "unconfigured"
+    assert (await health._r2_ready())[0] == "unconfigured"
 
 
 async def test_r2_readiness_does_not_take_the_service_out_of_rotation(
@@ -133,7 +133,7 @@ async def test_r2_readiness_does_not_take_the_service_out_of_rotation(
     those are the majority of requests. Returning 503 would take a mostly working
     service entirely offline.
     """
-    monkeypatch.setattr(r2, "health", lambda: _false())
+    monkeypatch.setattr(r2, "health", lambda: _broken())
     monkeypatch.setattr(health, "ping", _true)
 
     response = await health.readyz()
@@ -199,8 +199,13 @@ async def _true() -> bool:
     return True
 
 
-async def _false() -> bool:
-    return False
+async def _healthy() -> str | None:
+    """`r2.health` returns None when the bucket answers."""
+    return None
+
+
+async def _broken() -> str | None:
+    return "ClientError code=NoSuchBucket http=404 bucket='wrong' endpoint=https://acct.r2.cloudflarestorage.com"
 
 
 class _SessionRaising:
@@ -255,3 +260,37 @@ async def test_scratch_is_reported_writable_and_leaves_nothing_behind(
 
     assert health._scratch_ready() == "writable"
     assert list(tmp_path.iterdir()) == []
+
+
+async def test_readyz_publishes_why_r2_is_down_outside_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"down" alone still costs a trip to the host's logs.
+
+    The reason names the bucket and the endpoint, which are the two things that
+    are usually wrong.
+    """
+    monkeypatch.setattr(r2, "health", lambda: _broken())
+    monkeypatch.setattr(
+        health, "settings", health.settings.model_copy(update={"environment": "staging"})
+    )
+
+    state, why = await health._r2_ready()
+
+    assert state == "down"
+    assert why is not None and "NoSuchBucket" in why
+
+
+async def test_readyz_withholds_the_reason_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It is ours to know: it names our bucket and our endpoint."""
+    monkeypatch.setattr(r2, "health", lambda: _broken())
+    monkeypatch.setattr(
+        health, "settings", health.settings.model_copy(update={"environment": "production"})
+    )
+
+    state, why = await health._r2_ready()
+
+    assert state == "down"
+    assert why is None

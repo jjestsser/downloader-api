@@ -172,6 +172,37 @@ class Settings(BaseSettings):
     def _no_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
 
+    @field_validator("r2_account_id")
+    @classmethod
+    def _account_id_is_an_id_not_a_url(cls, value: str) -> str:
+        """Reject the thing that is easy to paste instead of the account ID.
+
+        `r2_endpoint_url` interpolates this straight into a hostname:
+
+            f"https://{r2_account_id}.r2.cloudflarestorage.com"
+
+        Cloudflare's dashboard shows the account ID inside the S3 API URL and
+        inside the dashboard's own address bar, so what gets copied is often
+        `https://<id>.r2.cloudflarestorage.com` or `<id>/downloader-artifacts`.
+        Either produces a nonsense hostname, `r2_configured` still reports true
+        because the string is non-empty, and the only symptom is that uploads
+        fail — which is a very long way from "you pasted a URL".
+
+        Deliberately a shape check, not a 32-hex-digits check: the format is
+        Cloudflare's to change, and rejecting a valid future account ID would be
+        a worse failure than the one being prevented.
+        """
+        if not value:
+            return value
+        if any(c in value for c in "/:. "):
+            raise ValueError(
+                f"R2_ACCOUNT_ID must be the bare account ID, not {value!r}. It is "
+                "interpolated into https://<id>.r2.cloudflarestorage.com, so a URL, a "
+                "hostname or an id/bucket pair yields an endpoint that resolves to "
+                "nothing. Copy the ID alone from the R2 dashboard's 'Account ID' field."
+            )
+        return value
+
     @field_validator("log_level")
     @classmethod
     def _upper_level(cls, value: str) -> str:

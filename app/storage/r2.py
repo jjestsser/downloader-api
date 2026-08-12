@@ -188,12 +188,21 @@ async def delete(key: str) -> None:
         log.warning("r2.delete_failed", extra={"key": key, "error": type(exc).__name__})
 
 
-async def health() -> bool:
-    """Cheap readiness probe: can we talk to the bucket at all?"""
+async def health() -> str | None:
+    """Cheap readiness probe: can we talk to the bucket at all?
+
+    Returns None when the bucket answers, and a log-safe description of the
+    failure otherwise — not a bool. `/readyz` saying only "down" leaves the
+    operator to open the host's logs to learn whether the bucket name is wrong,
+    the key is wrong or the endpoint is unreachable, and a staging service you
+    must read logs to understand is one you debug by redeploying. The caller
+    decides whether to publish the reason; it withholds it in production.
+    """
     try:
         async with _session.client("s3", **_client_kwargs()) as s3:  # type: ignore[call-overload]
             await asyncio.wait_for(s3.head_bucket(Bucket=settings.r2_bucket), timeout=5)
-        return True
+        return None
     except Exception as exc:  # noqa: BLE001
-        log.warning("r2.health_failed", extra={"error": _describe(exc)})
-        return False
+        described = _describe(exc)
+        log.warning("r2.health_failed", extra={"error": described})
+        return described

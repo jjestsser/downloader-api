@@ -72,8 +72,28 @@ async def download_job(ctx: dict[str, Any], payload: dict[str, Any]) -> dict[str
     proxy_tier = await current_level(platform)
     key: str | None = None
 
+    # Handled before the main body, and scoped to this one call, because a failure
+    # here is always infrastructure and never a logic bug — a root-owned volume
+    # mounted over SCRATCH_DIR, a full disk. Under the bare handler below it
+    # reported `internal`:
+    #
+    #   PermissionError: [Errno 13] Permission denied: '/scratch/<job id>'
+    #
+    # indistinguishable from a crash, while every other signal stayed green
+    # because nothing else in this service writes a file. Four deploys to find a
+    # one-line cause.
+    #
+    # Scoped rather than a broad `except OSError` around the whole body: half the
+    # network stack raises OSError subclasses, and a socket timeout mid-download
+    # is not a workspace problem.
     try:
         workdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        await _fail(job_id, "workspace_failed", detail=f"{type(exc).__name__}: {exc}"[:300])
+        log.exception("job_workspace_failed", job_id=job_id, platform=platform, url_hash=uh)
+        return {"state": "failed", "error_code": "workspace_failed"}
+
+    try:
         await set_state(job_id, state="running", progress=1)
 
         loop = asyncio.get_running_loop()
