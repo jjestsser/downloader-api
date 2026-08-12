@@ -1,0 +1,55 @@
+# Everything that is not needed to build the venv or run the app. Two reasons: build speed,
+# and making it impossible to bake a local .env or a stray cookies.txt into a published layer.
+
+.git
+.gitignore
+.github/
+
+# Secrets — the only reason this file is security-relevant.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+cookies.txt
+*.netrc
+
+# Local scratch / downloaded media
+scratch/
+/scratch
+downloads/
+*.mp4
+*.m4a
+*.mp3
+*.webm
+*.part
+*.ytdl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Tests and tooling do not belong in a runtime image
+tests/
+docs/
+docker-compose.yml
+docker-compose.*.yml
+Makefile
+.editorconfig
+.pre-commit-config.yaml
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp

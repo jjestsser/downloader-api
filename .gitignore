@@ -1,0 +1,31 @@
+# Secrets. TICKET_SECRET here is a symmetric HMAC key — anyone holding it can
+# mint tickets this service will accept, from any IP, forever. It must never be
+# committed, and if it ever is, rotate it on BOTH sides (here and the web app's
+# DOWNLOADER_TICKET_SECRET). Outstanding tickets die within 120 seconds, so
+# rotation is close to free.
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# The only writable directory at runtime. Holds part-downloaded media; nothing
+# in here is ever worth keeping.
+scratch/
+/scratch
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

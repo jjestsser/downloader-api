@@ -1,0 +1,113 @@
+# Local dev. Also the only place several of these controls can be expressed at all.
+#
+# WHAT SURVIVES THE TRIP TO RAILWAY:
+#   - non-root uid 10001, root-owned unwritable /app, /scratch as the only writable dir  -> YES (image)
+#   - TMPDIR/HOME/XDG_CACHE_HOME pinned to /scratch                                      -> YES (image)
+#   - tini as PID 1 reaping ffmpeg                                                        -> YES (image)
+#   - memory ceiling                                                                      -> YES, but as a
+#     plan/service resource limit configured in the Railway dashboard, not from this file
+#
+# WHAT DOES NOT SURVIVE:
+#   - read_only root filesystem            -> Railway gives every deploy a writable ephemeral FS
+#   - tmpfs /scratch with noexec,nosuid    -> not expressible; on Railway /scratch is ordinary disk,
+#                                             so a downloaded file there IS executable by the app user
+#   - cap_drop: ALL                        -> no capability control exposed
+#   - no-new-privileges                    -> no security_opt equivalent
+#   - pids_limit                           -> no equivalent; the ffmpeg timeout in app/jobs/download.py
+#                                             and arq's max_jobs are the real fork-bomb defence there
+#
+# Read that list as the honest statement of what the platform costs. The controls that vanish are
+# exactly why the in-image hardening (unwritable code, no writable dir on sys.path, explicit
+# subprocess timeouts, argv-only execution) has to carry the weight on its own.
+
+name: downloader
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    # No persistence: every key here (tickets, quotas, killswitch, canary state) is either
+    # short-TTL or cheap to rebuild. An RDB dump of this data is a liability, not an asset.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Start AS the redis user rather than letting the entrypoint drop privileges
+    # itself. The official image runs as root and calls `setpriv` to switch, which
+    # needs CAP_SETUID/CAP_SETGID — and `cap_drop: ALL` below removes exactly
+    # those, so the container died with
+    #   setpriv: setresuid failed: Operation not permitted
+    # Starting unprivileged reaches the same end state without needing the
+    # capability at all, which is strictly better than granting it back.
+    user: redis
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    mem_limit: 320m
+    pids_limit: 64
+    ports:
+      - "127.0.0.1:6379:6379"   # loopback only — never 0.0.0.0
+
+  # Local stand-in for Cloudflare R2. R2 speaks the S3 API, and so does MinIO, so
+  # the same `app/storage/r2.py` code path is exercised here as in production —
+  # only the endpoint changes. Without this the worker path cannot be tested end
+  # to end locally, which is how a broken upload reaches production unnoticed.
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # web console, handy when a job "succeeds" but the object is empty
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+      PORT: "8080"
+      # Point the R2 client at MinIO. `R2_ACCOUNT_ID` is unused when an explicit
+      # endpoint is set; see `_endpoint_url()` in app/storage/r2.py.
+      R2_ENDPOINT_URL_OVERRIDE: http://minio:9000
+      R2_ACCOUNT_ID: local
+      R2_ACCESS_KEY_ID: minioadmin
+      R2_SECRET_ACCESS_KEY: minioadmin
+      R2_BUCKET: downloads
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # --- hardening that only exists locally --------------------------------------------
+    read_only: true                    # /app and /opt/venv become physically unwritable
+    tmpfs:
+      # noexec is the important flag: a downloaded .mp4 that is secretly an ELF still cannot
+      # be executed. nosuid/nodev close the rest. size caps the whole scratch area so a
+      # runaway job fills a tmpfs, not the host disk.
+      - /scratch:rw,noexec,nosuid,nodev,size=2g,mode=0700,uid=10001,gid=10001
+    cap_drop:
+      - ALL                            # needs no capabilities: binds 8080 (>1024), never chroots
+    security_opt:
+      - no-new-privileges:true         # no setuid binary in the image can escalate
+    pids_limit: 256                    # ffmpeg fan-out ceiling
+    mem_limit: 2g                      # 1080p mux peaks well under this; OOM beats swap-thrash
+    memswap_limit: 2g                  # equal to mem_limit => swap disabled
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    restart: unless-stopped

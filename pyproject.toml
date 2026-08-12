@@ -1,0 +1,141 @@
+[project]
+name = "downloader"
+version = "1.0.0"
+description = "Media resolver/downloader service: direct-CDN handoff first, worker mux only when forced."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+
+# Lower bounds only, no upper caps. An upper cap on yt-dlp is a time bomb: extractors rot
+# within ~10 days of a platform change and the fix always ships as a new release.
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",        # [standard] pulls httptools + uvloop: measurably faster event loop
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",         # app/settings.py Settings(BaseSettings)
+    "redis>=5.2.0",                     # redis.asyncio — quotas, tickets, killswitch, canary state
+    "arq>=0.26.0",                      # job queue + worker cron (canary, yt-dlp freshness check)
+    "httpx>=0.28.0",                    # Turnstile verify, R2 HEAD checks, canary probes
+    # DO NOT ADD THE `curl-cffi` EXTRA. It looks like an obvious win and it is not.
+    #
+    # The argument for it is real: curl_cffi supplies the Chrome TLS/HTTP2
+    # fingerprint behind yt-dlp's `impersonate`, several extractors guard their
+    # logged-out paths with `if self._can_impersonate`, and Facebook's recurring
+    # "Cannot parse data" issues are filed upstream as "impersonation needed"
+    # (yt-dlp #15161, #12846). We tried it.
+    #
+    # MEASURED 2026-08-12, A/B on identical python:3.12-slim containers, same
+    # Docker network, same yt-dlp 2026.07.04, one real TikTok URL:
+    #
+    #   yt-dlp[default]                -> resolves fine (1280p)
+    #   yt-dlp[default,curl-cffi]      -> "Unexpected response from webpage request"
+    #
+    # With curl_cffi present the TikTok extractor never reaches its JS-challenge
+    # step. And the upside it was added for did not materialise: Instagram stayed
+    # at 6 formats / 0 muxed and Facebook at 10 / 0 muxed, identical either way.
+    # So it broke the highest-volume platform to buy nothing measurable.
+    #
+    # If you revisit this, A/B TikTok first, and pin the extra rather than
+    # installing curl_cffi bare (bare pulls 0.16.0, which this yt-dlp rejects
+    # while silently reporting every impersonate target as "(unavailable)").
+    "yt-dlp[default]>=2025.6.30",       # [default] = brotli/pycryptodomex/websockets/mutagen; several
+                                        # extractors silently degrade or fail without them
+    "aioboto3>=13.2.0",                 # async R2 multipart upload (S3 API)
+    "boto3>=1.35.0",                    # sync client for presign(); no network I/O, so no need to await
+    "prometheus-client>=0.21.0",        # GET /metrics
+    "python-multipart>=0.0.20",         # form-encoded Turnstile token posts
+    "honcho>=2.0.0",                    # runs Procfile inside the container (Railway's Dockerfile
+                                        # builder does NOT read a Procfile on its own)
+]
+
+[project.optional-dependencies]
+# Not installed in the runtime image. `uv sync --no-dev` in the Dockerfile skips this group.
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "pytest-cov>=6.0.0",
+    "fakeredis>=2.26.0",                # quota/ticket tests must not need a live Redis in CI
+    "respx>=0.22.0",                    # stub Turnstile + CDN HEAD calls
+    "ruff>=0.8.0",
+    "mypy>=1.14.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.uv]
+# Keeps `uv sync` from reinstalling the project on every source edit during local dev.
+package = true
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # import sorting
+    "UP",        # pyupgrade — keep the 3.12 syntax modern
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "ASYNC",     # blocking calls inside async def — the single most likely bug class here
+    "S",         # bandit: subprocess, hardcoded secrets, hashlib misuse
+    "T20",       # no stray print(); everything goes through app/logging_conf.py
+    "SIM",
+    "RUF",
+]
+ignore = [
+    "E501",      # formatter owns line length
+    "B008",      # FastAPI Depends() in defaults is the framework's idiom
+    "S104",      # 0.0.0.0 bind is correct inside a container
+]
+
+[tool.ruff.lint.per-file-ignores]
+# S101 assert, S105/S106 fake secrets, S311 non-crypto random are all fine in tests.
+"tests/**" = ["S101", "S105", "S106", "S311", "T20"]
+
+[tool.ruff.lint.flake8-bandit]
+# S602/S604 (shell=True) are NEVER allowed here — no per-file escape hatch exists on purpose.
+check-typed-exception = true
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+plugins = ["pydantic.mypy"]
+files = ["app"]
+
+[[tool.mypy.overrides]]
+# These ship no usable type information. Everything crossing their boundary is validated
+# into a pydantic model immediately, which is where the real type safety lives.
+module = ["yt_dlp.*", "aioboto3.*", "arq.*", "fakeredis.*"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning"]
