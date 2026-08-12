@@ -17,11 +17,18 @@ secrets file.
 from __future__ import annotations
 
 from typing import Final, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Environment = Literal["production", "staging", "development", "test"]
+
+#: Addresses that mean "this container" once the code leaves a laptop. Any of
+#: them in R2_ENDPOINT_URL_OVERRIDE is a copied-.env accident, never a choice.
+_LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset(
+    {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal", "minio"}
+)
 
 #: Values people type when they mean "I'll fill this in later". Treated as unset.
 _PLACEHOLDER_SECRETS: Final[frozenset[str]] = frozenset(
@@ -179,6 +186,18 @@ class Settings(BaseSettings):
         return self.environment == "production"
 
     @property
+    def is_deployed(self) -> bool:
+        """Running on a host, as opposed to on somebody's laptop.
+
+        Distinct from `is_production` because `staging` is deployed too, and the
+        settings that are *dangerous* off a laptop — a loopback address, a
+        placeholder bucket — are dangerous on staging for identical reasons. Every
+        guard that keyed off `is_production` alone silently exempted the one
+        environment this service actually runs in first.
+        """
+        return self.environment in ("production", "staging")
+
+    @property
     def cors_origins(self) -> list[str]:
         """ALLOWED_ORIGINS parsed into the exact strings a browser sends.
 
@@ -213,6 +232,38 @@ class Settings(BaseSettings):
             self.r2_endpoint_url_override
             or f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
         )
+
+    @model_validator(mode="after")
+    def _reject_loopback_storage_when_deployed(self) -> Settings:
+        """A local MinIO address must never survive the trip to a real host.
+
+        This one shipped. `.env` carries `R2_ENDPOINT_URL_OVERRIDE=http://127.0.0.1:9000`
+        so the upload path can be exercised against docker-compose's MinIO, that
+        file was copied wholesale into the platform's variables, and the override
+        beat `R2_ACCOUNT_ID` exactly as designed. In the container 127.0.0.1 is
+        the container — so every upload hit a refused connection, every job
+        failed, and the failure arrived as `internal` with `/readyz` still
+        reporting `"r2": "configured"`, because `r2_configured` does not look at
+        the override at all.
+
+        Refusing to boot is the right severity. The worker cannot deliver a single
+        download in this state, and a service that fails every request is worse
+        than one that never started: the second says why, in one line, at the top
+        of the deploy log.
+        """
+        if not self.is_deployed or not self.r2_endpoint_url_override:
+            return self
+
+        host = urlsplit(self.r2_endpoint_url_override).hostname or ""
+        if host in _LOOPBACK_HOSTS or host.endswith(".local"):
+            raise ValueError(
+                f"R2_ENDPOINT_URL_OVERRIDE points at {self.r2_endpoint_url_override!r}, "
+                f"which is this container, not object storage (ENVIRONMENT={self.environment}). "
+                "It exists so the upload path can be aimed at a local MinIO during "
+                "development and belongs only in a local .env. Delete the variable on "
+                "the host; the endpoint is then derived from R2_ACCOUNT_ID."
+            )
+        return self
 
     @property
     def metrics_enabled(self) -> bool:
