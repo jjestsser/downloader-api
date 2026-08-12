@@ -220,3 +220,38 @@ class _SessionRaising:
 
     async def upload_file(self, *_args: object, **_kwargs: object) -> None:
         raise self._exc
+
+
+# ---------------------------------------------------------------------------
+# /readyz must probe the scratch directory too
+# ---------------------------------------------------------------------------
+
+
+async def test_scratch_is_reported_unwritable_when_it_cannot_be_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A read-only or root-owned mount is the other way every job dies at once.
+
+    `download_job` starts by creating a subdirectory of SCRATCH_DIR. When that
+    fails, the job reports `internal` and every other signal stays green: the API
+    answers, Redis is up, `/v1/resolve` works — none of them write a file.
+    """
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o500)
+    monkeypatch.setattr(
+        health, "settings", health.settings.model_copy(update={"scratch_dir": str(locked)})
+    )
+
+    assert health._scratch_ready() == "unwritable"
+
+
+async def test_scratch_is_reported_writable_and_leaves_nothing_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The probe must not accumulate a directory per poll."""
+    monkeypatch.setattr(
+        health, "settings", health.settings.model_copy(update={"scratch_dir": str(tmp_path)})
+    )
+
+    assert health._scratch_ready() == "writable"
+    assert list(tmp_path.iterdir()) == []

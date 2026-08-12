@@ -123,6 +123,10 @@ async def job_status(job_id: str, ip_hash: str | None = None) -> JobStatus:
         error_code=meta.get("error_code") or None,
         download_url=download_url,
         expires_at=expires_at,
+        # Withheld in production: it is a raw exception message and can name
+        # paths, hosts and URL fragments. Everywhere else it is the difference
+        # between diagnosing a deploy and guessing at one.
+        error_detail=None if settings.is_production else (meta.get("error_detail") or None),
     )
 
 

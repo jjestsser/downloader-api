@@ -138,8 +138,13 @@ async def download_job(ctx: dict[str, Any], payload: dict[str, Any]) -> dict[str
         log.warning("job_extractor_failed", job_id=job_id, platform=platform, url_hash=uh)
         return {"state": "failed", "error_code": "extractor_failed"}
 
-    except Exception:
-        await _fail(job_id, "internal")
+    except Exception as exc:
+        # The message is recorded alongside the code, not just logged. `internal`
+        # means "we did not anticipate this", so it is the one failure that says
+        # nothing on its own — a refused connection, an unwritable directory and a
+        # real bug all arrive as the same five-letter string. `job_status` only
+        # releases this outside production.
+        await _fail(job_id, "internal", detail=f"{type(exc).__name__}: {exc}"[:300])
         log.exception("job_crashed", job_id=job_id, platform=platform, url_hash=uh)
         return {"state": "failed", "error_code": "internal"}
 
@@ -263,5 +268,5 @@ def _safe_name(info: dict[str, Any], produced: Path) -> str:
     return f"{cleaned}.{ext}"
 
 
-async def _fail(job_id: str, code: str) -> None:
-    await set_state(job_id, state="failed", error_code=code, progress=0)
+async def _fail(job_id: str, code: str, detail: str | None = None) -> None:
+    await set_state(job_id, state="failed", error_code=code, progress=0, error_detail=detail)

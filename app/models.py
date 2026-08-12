@@ -112,6 +112,19 @@ class JobStatus(BaseModel):
     download_url: str | None = None
     expires_at: int | None = None
 
+    #: The exception behind an `internal` failure, outside production only.
+    #:
+    #: `internal` is the code for "something we did not anticipate", which makes
+    #: it the one failure with no diagnostic value at all — a refused connection,
+    #: an unwritable directory and a genuine bug are one string. Recovering the
+    #: difference meant reading the host's logs, and a staging service whose logs
+    #: you must open to learn anything is a service you debug by guessing.
+    #:
+    #: Suppressed in production because it is a raw exception message: it can
+    #: carry paths, hostnames and occasionally fragments of a URL that a public
+    #: endpoint has no business handing out. `queue.job_status` decides.
+    error_detail: str | None = None
+
 
 class TicketClaims(BaseModel):
     """Verified payload of an `X-Download-Ticket` header.

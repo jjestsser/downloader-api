@@ -25,6 +25,7 @@ from __future__ import annotations
 import hmac
 import threading
 import time
+from pathlib import Path
 from typing import Any, Final
 
 from fastapi import APIRouter, Header, Request, Response
@@ -236,6 +237,36 @@ async def _r2_ready() -> str:
     return "up" if _r2_probe["ok"] else "down"
 
 
+def _scratch_ready() -> str:
+    """Can this process actually create a per-job working directory?
+
+    Same lesson as R2, one layer down. `SCRATCH_DIR` is the only writable path in
+    the image, and `download_job` starts by creating a subdirectory of it. If that
+    fails the job dies before its first progress update, reports `internal`, and
+    every other signal the service emits stays green — the API answers, Redis is
+    up, `/v1/resolve` works, because none of them write a file.
+
+    The mode is deployment-dependent, which is exactly why it needs checking at
+    runtime rather than reasoning about: the Dockerfile creates /scratch owned by
+    uid 10001, and a volume mounted over that path may arrive owned by root.
+
+    Cheap enough to run unconditionally — one mkdir and one rmdir on local disk —
+    so unlike the R2 probe it is not cached. A stale answer here would be worse
+    than the round trip it saves.
+    """
+    probe = Path(settings.scratch_dir) / ".readyz-probe"
+    try:
+        probe.mkdir(parents=True, exist_ok=True)
+        probe.rmdir()
+        return "writable"
+    except OSError as exc:
+        log.warning(
+            "scratch_unwritable",
+            extra={"path": settings.scratch_dir, "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return "unwritable"
+
+
 @router.get("/readyz", include_in_schema=False)
 async def readyz() -> JSONResponse:
     """Readiness: 503 while Redis is unreachable, because nothing works without it."""
@@ -244,6 +275,7 @@ async def readyz() -> JSONResponse:
         "status": "ready" if redis_ok else "not_ready",
         "redis": "up" if redis_ok else "down",
         "r2": await _r2_ready(),
+        "scratch": _scratch_ready(),
         "env": settings.environment,
     }
     status_code = 200 if redis_ok else 503

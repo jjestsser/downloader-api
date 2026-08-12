@@ -101,3 +101,16 @@ def test_the_endpoint_is_derived_from_the_account_when_unset(environment: str) -
     settings = Settings(_env_file=None, environment=environment, **BASE)
 
     assert settings.r2_endpoint_url == "https://acct.r2.cloudflarestorage.com"
+
+
+@pytest.mark.parametrize("environment", DEPLOYED + LOCAL)
+def test_error_detail_is_released_only_outside_production(environment: str) -> None:
+    """`internal` says nothing on its own; the exception behind it says everything.
+
+    Which is also why it stays in the building in production: it is a raw
+    exception message and can carry paths, hostnames and URL fragments that a
+    public endpoint has no business handing out.
+    """
+    settings = Settings(_env_file=None, environment=environment, **BASE)
+
+    assert settings.is_production == (environment == "production")
