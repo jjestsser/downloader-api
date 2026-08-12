@@ -114,3 +114,47 @@ def test_error_detail_is_released_only_outside_production(environment: str) -> N
     settings = Settings(_env_file=None, environment=environment, **BASE)
 
     assert settings.is_production == (environment == "production")
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "https://abc123.r2.cloudflarestorage.com",
+        "abc123.r2.cloudflarestorage.com",
+        "abc123/downloader-artifacts",
+    ],
+)
+def test_an_account_id_that_is_really_a_url_is_rejected(pasted: str) -> None:
+    """The dashboard shows the ID inside a URL, so a URL is what gets pasted.
+
+    It is interpolated straight into a hostname, `r2_configured` still reports
+    true because the string is non-empty, and the only symptom is that uploads
+    fail — a very long way from "you pasted a URL".
+    """
+    values = {**BASE, "r2_account_id": pasted}
+    with pytest.raises(ValueError) as excinfo:
+        Settings(_env_file=None, environment="staging", **values)
+
+    assert "R2_ACCOUNT_ID" in str(excinfo.value)
+
+
+def test_a_bare_account_id_is_accepted() -> None:
+    settings = Settings(
+        _env_file=None, environment="staging", **{**BASE, "r2_account_id": "a1b2c3d4e5f6"}
+    )
+
+    assert settings.r2_endpoint_url == "https://a1b2c3d4e5f6.r2.cloudflarestorage.com"
+
+
+def test_surrounding_whitespace_is_stripped_rather_than_rejected() -> None:
+    """`_strip` runs first, and exists because variable editors add whitespace.
+
+    Rejecting `"abc123 "` would punish a paste that the service already knows how
+    to handle, and an HMAC that silently fails on a trailing space is the reason
+    that stripping is there at all.
+    """
+    settings = Settings(
+        _env_file=None, environment="staging", **{**BASE, "r2_account_id": "  abc123  "}
+    )
+
+    assert settings.r2_account_id == "abc123"

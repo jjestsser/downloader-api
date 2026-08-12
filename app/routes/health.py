@@ -211,10 +211,10 @@ async def healthz() -> JSONResponse:
 #: every poll is a needless round trip to Cloudflare. Short enough that a fixed
 #: bucket shows up within a minute of the fix.
 _R2_PROBE_TTL_S: Final[int] = 30
-_r2_probe: dict[str, Any] = {"at": 0.0, "ok": False}
+_r2_probe: dict[str, Any] = {"at": 0.0, "why": None}
 
 
-async def _r2_ready() -> str:
+async def _r2_ready() -> tuple[str, str | None]:
     """Actually talk to the bucket, rather than counting non-empty env vars.
 
     This reported "configured" while every worker job died on upload. Four
@@ -228,13 +228,19 @@ async def _r2_ready() -> str:
     outage should degrade this service, not remove it from rotation.
     """
     if not settings.r2_configured:
-        return "unconfigured"
+        return "unconfigured", None
 
     now = time.time()
     if now - _r2_probe["at"] > _R2_PROBE_TTL_S:
-        _r2_probe["ok"] = await r2.health()
+        _r2_probe["why"] = await r2.health()
         _r2_probe["at"] = now
-    return "up" if _r2_probe["ok"] else "down"
+
+    why = _r2_probe["why"]
+    if why is None:
+        return "up", None
+    # The reason names the bucket and endpoint, which is the whole point — those
+    # two are what is usually wrong — but they are ours, not a caller's business.
+    return "down", None if settings.is_production else why
 
 
 def _scratch_ready() -> str:
@@ -271,13 +277,16 @@ def _scratch_ready() -> str:
 async def readyz() -> JSONResponse:
     """Readiness: 503 while Redis is unreachable, because nothing works without it."""
     redis_ok = await ping()
+    r2_state, r2_why = await _r2_ready()
     payload: dict[str, Any] = {
         "status": "ready" if redis_ok else "not_ready",
         "redis": "up" if redis_ok else "down",
-        "r2": await _r2_ready(),
+        "r2": r2_state,
         "scratch": _scratch_ready(),
         "env": settings.environment,
     }
+    if r2_why:
+        payload["r2_detail"] = r2_why
     status_code = 200 if redis_ok else 503
     return JSONResponse(
         payload,
