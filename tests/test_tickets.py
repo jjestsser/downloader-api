@@ -287,13 +287,33 @@ async def test_ip_mismatch_does_not_burn_the_ticket() -> None:
     assert claims.ip_hash == hash_ip(CLIENT_IP)
 
 
-async def test_spoofed_forwarded_for_prefix_is_ignored() -> None:
-    """Railway appends the observed peer; we read from the right, not the left."""
+async def test_leftmost_forwarded_for_entry_is_the_client() -> None:
+    """The first X-Forwarded-For entry wins, matching what the minter reads.
+
+    This replaced a rightmost-Nth-hop rule that had to know how many proxies sat
+    in front. That count is a property of the deployment, not of the code — 1 on
+    a bare Railway domain, 2 behind Cloudflare — and every wrong guess presented
+    identically: `ip_mismatch`, a 401, no clue why.
+
+    Spoofing the header is not a way around the quotas. Every limit is keyed off
+    `claims.ip_hash`, which comes out of the HMAC-signed ticket rather than out
+    of this header (see `consume_resolve_quota` / `consume_bytes_quota` call
+    sites). Forging an address here only makes the check below fail, so it costs
+    the attacker their own ticket and gains them nothing.
+    """
     ticket = tickets.mint_ticket(CLIENT_IP)
-    request = make_request(ticket, ip=f"1.2.3.4, {CLIENT_IP}")
+    request = make_request(ticket, ip=f"{CLIENT_IP}, 10.0.0.7")
 
     claims = await tickets.require_ticket(request)
     assert claims.ip_hash == hash_ip(CLIENT_IP)
+
+
+async def test_forged_forwarded_for_fails_rather_than_bypassing_the_binding() -> None:
+    """A client-chosen address does not silently become the trusted one."""
+    ticket = tickets.mint_ticket(CLIENT_IP)
+    request = make_request(ticket, ip=f"1.2.3.4, {CLIENT_IP}")
+
+    await assert_api_error("ticket_bad_signature", tickets.require_ticket(request))
 
 
 async def test_ticket_from_a_different_secret_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

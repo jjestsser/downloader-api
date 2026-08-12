@@ -75,8 +75,6 @@ CLOCK_SKEW_S: Final[int] = 5
 #: X-Forwarded-For, never the left.  The leftmost entry is whatever the client
 #: chose to send; the rightmost entries are appended by infrastructure we trust.
 #: Set this wrong and quota evasion becomes a one-line curl flag.
-TRUSTED_PROXY_HOPS: Final[int] = 1
-
 #: Refuse absurd header values before spending CPU on them.
 MAX_TICKET_BYTES: Final[int] = 1024
 
@@ -134,42 +132,52 @@ def _fail(code: str, detail: str, **ctx: Any) -> NoReturn:
 
 
 def client_ip(request: Request) -> str:
-    """Best-effort real client address, resistant to header spoofing.
+    """Best-effort real client address.
 
-    Railway's edge appends the observed peer address to ``X-Forwarded-For``.  A
-    client that pre-sets the header produces ``"1.2.3.4, <real>"``; taking the
-    entry ``TRUSTED_PROXY_HOPS`` from the right therefore yields the real one
-    and ignores the forged prefix entirely.
+    This value has to match, byte for byte, the address the minting route hashed
+    into the ticket. When it does not, every request 401s with ``ip_mismatch``
+    and nothing in the response says why — so the rule here is deliberately the
+    dumbest one that works everywhere, not the cleverest one.
 
-    Note what happens to an attacker who spoofs anyway: the value here stops
-    matching the ``ip_hash`` baked into their ticket by the minting route (which
-    saw an address the client could not influence), so the request is rejected
-    outright.  Spoofing X-Forwarded-For against this service is not a quota
-    bypass, it is a self-inflicted 401.
+    Note what happens to an attacker who spoofs the header anyway: the value
+    here stops matching the ``ip_hash`` baked into their ticket by the minting
+    route, so the request is rejected outright. Spoofing X-Forwarded-For against
+    this service is not a quota bypass, it is a self-inflicted 401.
     """
-    # Cloudflare sets CF-Connecting-IP to the true client address and strips any
-    # copy the client tried to send, so where it exists it is both simpler and
-    # safer than counting X-Forwarded-For hops.
-    #
-    # Counting hops is what broke here: the documented topology is
-    # client -> Cloudflare -> Railway -> app, which appends TWO entries, so
-    # TRUSTED_PROXY_HOPS=1 selected Cloudflare's edge address. Every ticket then
-    # failed its ip_hash check and the whole service returned 401 — with the
-    # least debuggable symptom available. The minter must read the same header;
-    # see contrib/mint-ticket.ts.
+    # Cloudflare, when it is in front, sets CF-Connecting-IP to the true client
+    # and strips any copy the client tried to send. Most authoritative when
+    # present, absent on a bare *.up.railway.app domain.
     cf_ip = request.headers.get("cf-connecting-ip", "").strip()
     if cf_ip:
         return cf_ip
 
+    # LEFTMOST X-Forwarded-For entry, not a counted-from-the-right one.
+    #
+    # Counting hops requires knowing exactly how many proxies sit in front, and
+    # that number is a property of the deployment, not of the code. It is 1 on a
+    # bare Railway domain, 2 behind Cloudflare, something else on another host —
+    # and every wrong guess presents identically: `ip_mismatch`, a 401, and no
+    # clue why. That fragility cost a full debugging session.
+    #
+    # The leftmost entry is what the minting side uses (Vercel documents its own
+    # `x-forwarded-for` as client-first), so both sides now derive the same
+    # address by the same rule in every topology.
+    #
+    # Spoofing is handled by the platform, not by arithmetic here: uvicorn runs
+    # with `--proxy-headers --forwarded-allow-ips='*'` (see the Procfile), which
+    # is only safe because nothing but Railway's own proxy can reach this port —
+    # a client-supplied X-Forwarded-For is replaced by the edge, not appended to.
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
-        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
-        if parts:
-            index = max(len(parts) - TRUSTED_PROXY_HOPS, 0)
-            return parts[index]
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+
     real_ip = request.headers.get("x-real-ip", "").strip()
     if real_ip:
         return real_ip
+
+    # uvicorn has already resolved this from the proxy headers it trusts.
     return request.client.host if request.client else ""
 
 
@@ -315,12 +323,20 @@ async def verify_ticket(raw: str | None, peer_ip: str) -> TicketClaims:
         # own machine and deny service to the legitimate holder - a griefing
         # primitive handed out for free.  Failing here leaves the real user's
         # ticket untouched and still usable.
+        # `peer_ip` is logged in the clear, and only on this branch. Two salted
+        # digests that differ tell you nothing about *why* they differ, and that
+        # is precisely the failure this service is hardest to debug from the
+        # outside: the response says `ticket_bad_signature` whether the secret is
+        # wrong or the address is, and a wrong address here means the service is
+        # 100% broken for every visitor. One address, on a path that only runs
+        # when something is already misconfigured, is worth that.
         _fail(
             "ticket_bad_signature",
             "Invalid ticket.",
             reason="ip_mismatch",
             claimed=claims.ip_hash,
             observed=expected_ip_hash,
+            peer_ip=peer_ip,
         )
 
     await _burn(claims.jti)
@@ -336,4 +352,33 @@ async def require_ticket(request: Request) -> TicketClaims:
     recomputing one, so that every counter is anchored to a value that survived
     an HMAC check.
     """
+    _log_forwarding_topology_once(request)
     return await verify_ticket(request.headers.get(TICKET_HEADER), client_ip(request))
+
+
+_topology_logged = False
+
+
+def _log_forwarding_topology_once(request: Request) -> None:
+    """Record how many proxies actually sit in front, once per process.
+
+    How the edge fills X-Forwarded-For is a property of the deployment, and
+    getting it wrong takes down the whole service behind an error message that
+    names the wrong cause. Nothing in the code can discover it, so the first
+    request of each boot writes it down. Reading one log line beats another
+    round of deploy-and-guess.
+    """
+    global _topology_logged
+    if _topology_logged:
+        return
+    _topology_logged = True
+    log.info(
+        "forwarding_topology",
+        extra={
+            "xff": request.headers.get("x-forwarded-for", ""),
+            "cf_connecting_ip": request.headers.get("cf-connecting-ip", ""),
+            "x_real_ip": request.headers.get("x-real-ip", ""),
+            "peer": request.client.host if request.client else "",
+            "derived": client_ip(request),
+        },
+    )
