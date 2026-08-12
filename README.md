@@ -126,8 +126,20 @@ so billing, env vars and suspension are all scoped separately.
 is a change to this service.
 Builder is `DOCKERFILE` (see `railway.json`).
 
-**4. Add a volume** mounted at `/scratch`. Without it, downloads land on the ephemeral layer and a
-restart mid-job leaves nothing to clean up — the worker clears the directory on startup.
+**4. Do NOT mount a volume at `/scratch`.** An earlier version of this file told you to, and that
+instruction took the service down: Railway provisions a volume owned by `root`, the mount shadows the
+`install -d -o 10001` in the Dockerfile, and the container runs as uid 10001. Every job then died on
+its first `mkdir` — reported as `internal`, with `/readyz` green, because nothing else in the service
+writes a file. `TMPDIR`, `HOME` and `XDG_CACHE_HOME` all point into `/scratch` too, so it took yt-dlp
+and ffmpeg with it.
+
+The rationale for the volume was also backwards. `/scratch` holds part-downloaded media and nothing
+else; the finished file goes to R2 and the directory is deleted in a `finally`. Landing on the
+ephemeral layer is the *desired* behaviour — a restart mid-job leaves nothing to clean up. There is
+nothing here worth persisting, and persisting it costs money.
+
+`/readyz` reports `"scratch": "writable" | "unwritable"`, so this is now one curl away rather than
+three deploys.
 
 **5. Set the environment variables** from `.env.example`. Generate the two secrets properly:
 

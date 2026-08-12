@@ -38,6 +38,12 @@ ERROR_CODES: Final[dict[str, int]] = {
     # indistinguishable from outside, and `/readyz` reported "r2: configured"
     # for both because it only checked that four env vars were non-empty.
     "storage_failed": 502,
+    # A local filesystem failure — an unwritable scratch directory, a full disk.
+    # Always infrastructure, never a logic bug, which is why it does not belong
+    # under `internal`: the two want completely different responses. This shipped
+    # as `internal` and cost four deploys to find, because a root-owned volume
+    # mounted over /scratch and a null-pointer bug were the same five letters.
+    "workspace_failed": 502,
     "internal": 500,
     # Framework-level failures. These are raised by main.py's handlers rather
     # than by business logic, but they must live here: the front-end switches on
@@ -68,6 +74,7 @@ DEFAULT_DETAIL: Final[dict[str, str]] = {
     "platform_degraded": "That platform is temporarily unavailable. Please try again later.",
     "job_not_found": "That download job does not exist or has expired.",
     "storage_failed": "We fetched your file but could not store it. This is our fault, not your link.",
+    "workspace_failed": "Our servers could not prepare your file. This is our fault, not your link.",
     "internal": "Something went wrong on our side.",
     "invalid_request": "That request was not in a form this service understands.",
     "not_found": "There is nothing at this address.",
