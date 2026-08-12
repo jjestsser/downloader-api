@@ -23,19 +23,22 @@ WORKDIR /build
 
 # Dependency layer first so source edits do not re-resolve the whole tree.
 #
-# `id=` is required by Railway's builder and optional for plain BuildKit, which
-# defaults it to the target path. Omitting it built fine locally and failed on
-# Railway with "flag '--mount=type=cache,...' is missing an id argument" — so
-# keep the id even though a local `docker build` does not need it.
+# NO BuildKit cache mount here, deliberately. `--mount=type=cache` would speed up
+# rebuilds, but Railway's builder rejects it twice over: first for a missing
+# `id=`, then for an id lacking its `s/<service-id>-` cacheKey prefix. Satisfying
+# that means hardcoding a Railway service id into the Dockerfile, which makes the
+# file non-portable and breaks a plain `docker build` for the next person.
+#
+# The cost of leaving it out is that uv re-downloads wheels on every build —
+# roughly a minute. That is worth paying to keep one Dockerfile that builds
+# identically on Railway, on a laptop, and in any other CI.
 COPY pyproject.toml ./
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv sync --no-dev --no-install-project
+RUN uv sync --no-dev --no-install-project
 
 # Then the project itself.
 COPY README.md ./
 COPY app ./app
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv sync --no-dev
+RUN uv sync --no-dev
 
 # For byte-reproducible builds: commit uv.lock, add it to the COPY above, and swap both
 # syncs to `uv sync --frozen ...`. Left off by default so a fresh clone builds without
