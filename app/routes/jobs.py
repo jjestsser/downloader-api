@@ -26,12 +26,17 @@ from app.logging_conf import log
 from app.models import JobCreateRequest, JobStatus, TicketClaims
 from app.resolver import canary, platforms
 from app.resolver.ytdlp import url_hash
+from app.security.origin import require_edge
 from app.security.quotas import check_killswitch, consume_resolve_quota
 from app.security.tickets import require_ticket
 from app.security.turnstile import verify_turnstile
 from app.settings import settings
 
-router = APIRouter(prefix="/v1", tags=["jobs"])
+# `require_edge` is a no-op until ORIGIN_SHARED_TOKEN is set, and setting it
+# requires a Cloudflare Transform Rule in front of this service. Until then the
+# real protection is that `client_ip` no longer believes CF-Connecting-IP
+# without proof — see app/security/origin.py.
+router = APIRouter(prefix="/v1", tags=["jobs"], dependencies=[Depends(require_edge)])
 
 TURNSTILE_HEADER = "X-Turnstile-Token"
 
@@ -70,6 +75,12 @@ async def create_job(
         client_ip = request.client.host if request.client else ""
         if not await verify_turnstile(token, client_ip):
             raise ApiError("turnstile_failed")
+
+    # Before anything is spent. The byte quota is otherwise charged only once
+    # the file exists, so without this check a caller already over their daily
+    # allowance still pulls every subsequent download in full before being told
+    # no — a refusal that costs the operator exactly what a success would.
+    await assert_bytes_budget_available(claims.ip_hash)
 
     # A job is at least as expensive as a resolve, so it costs a resolve slot too.
     await consume_resolve_quota(claims.ip_hash)

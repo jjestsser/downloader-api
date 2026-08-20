@@ -27,10 +27,15 @@ from app.errors import ApiError
 from app.logging_conf import log
 from app.models import ResolveResponse, TicketClaims
 from app.resolver import canary, platforms, ytdlp
+from app.security.origin import require_edge
 from app.security.quotas import check_killswitch, consume_resolve_quota
 from app.security.tickets import require_ticket
 
-router = APIRouter(prefix="/v1", tags=["resolve"])
+# `require_edge` is a no-op until ORIGIN_SHARED_TOKEN is set, and setting it
+# requires a Cloudflare Transform Rule in front of this service. Until then the
+# real protection is that `client_ip` no longer believes CF-Connecting-IP
+# without proof — see app/security/origin.py.
+router = APIRouter(prefix="/v1", tags=["resolve"], dependencies=[Depends(require_edge)])
 
 
 async def killswitch_guard() -> None:

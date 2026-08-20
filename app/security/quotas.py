@@ -249,6 +249,52 @@ async def consume_bytes_quota(ip_hash: str, n: int) -> None:
         )
 
 
+async def assert_bytes_budget_available(ip_hash: str) -> None:
+    """Refuse a new job when today's byte allowance is already gone.
+
+    :func:`consume_bytes_quota` is charged with the true size, which cannot be
+    known until the file exists — so on its own it can refuse to *hand over* a
+    download but never refuses to *pay for* one. Every job submitted after the
+    counter passed the limit still pulled its full payload through the proxy,
+    raised ``quota_exceeded``, and threw the file away. The refusal cost exactly
+    as much as no quota at all, which is the one thing a spend control must not
+    do.
+
+    Checking the counter before the worker starts costs one Redis read and caps
+    the overshoot at a single file instead of an unbounded number of them. It
+    does not need an expected size, which is what made the pre-charge described
+    in :func:`consume_bytes_quota` impossible to implement honestly: nothing at
+    enqueue time knows how big the result will be, and a client-supplied guess
+    is a client-controlled quota.
+
+    Deliberately not a reservation. Two jobs starting at once can still both
+    pass, so the true bound is `in-flight jobs x max filesize` rather than the
+    daily limit exactly. Bounding that further is the concurrency cap's job, not
+    this function's.
+    """
+    limit_bytes = settings.bytes_quota_per_day
+    if limit_bytes <= 0:
+        return
+
+    redis = await get_redis()
+    key = _BYTES_KEY.format(ip_hash=ip_hash, day=_utc_day())
+    used = int(await redis.get(key) or 0)
+    if used >= limit_bytes:
+        log.warning(
+            "quota_exceeded",
+            extra={
+                "kind": "bytes_precheck",
+                "ip_hash": ip_hash,
+                "used_bytes": used,
+                "limit_bytes": limit_bytes,
+            },
+        )
+        raise ApiError(
+            "quota_exceeded",
+            detail="You have used today's downloads from this connection.",
+        )
+
+
 async def quota_snapshot(ip_hash: str) -> dict[str, int]:
     """Read today's counters without charging anything (for /metrics and tests)."""
     redis = await get_redis()
