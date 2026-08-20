@@ -42,6 +42,7 @@ from app.errors import ApiError
 from app.logging_conf import log
 from app.models import TicketClaims
 from app.redis_conn import get_redis
+from app.security.origin import came_through_edge
 from app.security.quotas import hash_ip
 from app.settings import settings
 
@@ -139,39 +140,57 @@ def client_ip(request: Request) -> str:
     and nothing in the response says why — so the rule here is deliberately the
     dumbest one that works everywhere, not the cleverest one.
 
-    Note what happens to an attacker who spoofs the header anyway: the value
-    here stops matching the ``ip_hash`` baked into their ticket by the minting
-    route, so the request is rejected outright. Spoofing X-Forwarded-For against
-    this service is not a quota bypass, it is a self-inflicted 401.
-    """
-    # Cloudflare, when it is in front, sets CF-Connecting-IP to the true client
-    # and strips any copy the client tried to send. Most authoritative when
-    # present, absent on a bare *.up.railway.app domain.
-    cf_ip = request.headers.get("cf-connecting-ip", "").strip()
-    if cf_ip:
-        return cf_ip
+    This docstring used to argue that spoofing was self-defeating: the value
+    computed here would stop matching the ``ip_hash`` in the attacker's ticket,
+    so the request would 401. That is true of an attacker who spoofs one side.
+    It is false of one who spoofs both, which is the whole attack — present the
+    same fabricated address to the minting route and to this service, watch the
+    two agree, and land in a per-IP quota bucket nobody else is using. Repeat
+    with the next address for another. The daily caps stop being caps.
 
-    # LEFTMOST X-Forwarded-For entry, not a counted-from-the-right one.
+    Measured against the deployed service on 2026-08-21: a ticket minted for
+    198.51.100.7 and presented with ``CF-Connecting-IP: 198.51.100.7`` was
+    accepted; the same trick through ``X-Forwarded-For`` was refused, because
+    Railway's proxy overwrites that header and does not touch the other one.
+    """
+    # Cloudflare sets CF-Connecting-IP to the true client and strips any copy the
+    # caller sent — but only when Cloudflare is actually in front. On a bare
+    # *.up.railway.app hostname nothing strips it, so without proof that the
+    # request came through the edge it is just a string the caller chose.
+    if came_through_edge(request):
+        cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+        if cf_ip:
+            return cf_ip
+
+    # RIGHTMOST X-Forwarded-For entry. Still not a counted-from-the-right one.
     #
     # Counting hops requires knowing exactly how many proxies sit in front, and
-    # that number is a property of the deployment, not of the code. It is 1 on a
-    # bare Railway domain, 2 behind Cloudflare, something else on another host —
-    # and every wrong guess presents identically: `ip_mismatch`, a 401, and no
-    # clue why. That fragility cost a full debugging session.
+    # that number is a property of the deployment, not of the code — every wrong
+    # guess presents identically as a 401 with no clue why. So this is not that:
+    # it is the last entry, whatever the length.
     #
-    # The leftmost entry is what the minting side uses (Vercel documents its own
-    # `x-forwarded-for` as client-first), so both sides now derive the same
-    # address by the same rule in every topology.
+    # Why the last and not the first. If the platform in front replaces this
+    # header, the list is one entry and the two ends are the same value, which is
+    # the case here and is what makes the current deployment work either way. If
+    # it ever appends instead, the first entry is whatever the caller claimed and
+    # the last is what the platform itself observed. Only one of those is worth
+    # binding a quota to, and choosing it costs nothing while the lists are short.
+    #
+    # `clientIpFrom` in src/lib/tools/download/ticket.ts says the same. The two
+    # disagreed until 2026-08-21 — this side took the first, that side took the
+    # last — and agreed in practice only by the coincidence described above.
     #
     # Spoofing is handled by the platform, not by arithmetic here: uvicorn runs
     # with `--proxy-headers --forwarded-allow-ips='*'` (see the Procfile), which
     # is only safe because nothing but Railway's own proxy can reach this port —
     # a client-supplied X-Forwarded-For is replaced by the edge, not appended to.
+    # That replacement is what the measurement above confirmed: the same attack
+    # that succeeded through CF-Connecting-IP failed through this header.
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
+        entries = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if entries:
+            return entries[-1]
 
     real_ip = request.headers.get("x-real-ip", "").strip()
     if real_ip:

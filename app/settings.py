@@ -61,6 +61,7 @@ SECRET_FIELDS: Final[frozenset[str]] = frozenset(
         "r2_access_key_id",
         "r2_secret_access_key",
         "metrics_token",
+        "origin_shared_token",
         "proxy_datacenter_url",
         "proxy_residential_url",
     }
@@ -93,6 +94,14 @@ class Settings(BaseSettings):
     ticket_secret: str = ""
     ip_salt: str = ""
     turnstile_secret: str = ""
+
+    #: Shared secret a Cloudflare Transform Rule injects on every proxied request.
+    #:
+    #: Empty means no edge is in front, which is a statement about the
+    #: deployment rather than a switch: `CF-Connecting-IP` is then ignored
+    #: entirely, because nothing on the path strips a copy the caller sent.
+    #: See app/security/origin.py for the measurement behind that.
+    origin_shared_token: str = ""
 
     # WHY a raw CSV string rather than list[str]: pydantic-settings JSON-decodes
     # complex-typed fields straight out of the environment, so a plain
@@ -144,6 +153,7 @@ class Settings(BaseSettings):
         "ticket_secret",
         "ip_salt",
         "turnstile_secret",
+        "origin_shared_token",
         "allowed_origins",
         "r2_account_id",
         "r2_access_key_id",
