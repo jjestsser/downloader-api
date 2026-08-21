@@ -49,7 +49,6 @@ KEEP_RESULT_S: Final[int] = 3600
 
 async def startup(ctx: dict[str, Any]) -> None:
     setup_logging()
-    await _update_ytdlp()
     _clear_scratch()
     log.info("worker_started", max_jobs=MAX_JOBS, environment=settings.environment)
 
@@ -58,34 +57,22 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     log.info("worker_stopping")
 
 
-async def _update_ytdlp() -> None:
-    """Upgrade yt-dlp in place, but never block startup on it.
-
-    A failed update is not fatal: the pinned version still works for most
-    platforms, and refusing to boot would turn a PyPI blip into an outage.
-    """
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
-        if proc.returncode == 0:
-            import importlib.metadata as md
-
-            try:
-                version = md.version("yt-dlp")
-            except Exception:
-                version = "unknown"
-            log.info("ytdlp_updated", version=version)
-        else:
-            log.warning("ytdlp_update_failed", rc=proc.returncode, stderr=err.decode()[:200])
-    except asyncio.TimeoutError:
-        log.warning("ytdlp_update_timeout")
-    except Exception:
-        log.warning("ytdlp_update_error", exc_info=True)
+# `_update_ytdlp` used to live here, running `pip install --upgrade yt-dlp` at
+# worker startup. It could never have worked, in two independent ways:
+#
+#   * the venv is built by `uv sync`, which does not install pip — every boot
+#     logged `ytdlp_update_failed: /opt/venv/bin/python: No module named pip`
+#   * the Dockerfile runs `chmod -R a-w /opt/venv`, deliberately, so nothing at
+#     runtime can write to what it executes
+#
+# The second one is a security property worth keeping, which makes in-place
+# upgrading the wrong idea rather than a broken one. Removing the function
+# instead of fixing it.
+#
+# Updating happens at image build: pyproject pins `yt-dlp[default]>=2025.6.30`
+# with no upper bound and there is no lockfile, so every rebuild resolves the
+# current release. Extractors rot in days, so the rebuild wants to be on a
+# schedule rather than on a push.
 
 
 def _clear_scratch() -> None:

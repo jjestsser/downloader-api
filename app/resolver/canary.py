@@ -167,6 +167,20 @@ async def _check(platform: str, url: str) -> str:
         # ApiError carries the useful label (extractor_failed, platform_degraded);
         # everything else falls back to the exception class name.
         reason = getattr(exc, "code", None) if isinstance(exc, ApiError) else None
+
+        # An ApiError is the extractor reporting a situation it understands, and
+        # its code says everything. Anything else is a bug in this service, and
+        # the class name alone says almost nothing — YouTube sat degraded with
+        # `reason="TypeError"` and 424 recorded failures, and not one of them
+        # left a traceback to read. Losing the one artefact that explains a
+        # repeatable failure is worse than the failure.
+        if not isinstance(exc, ApiError):
+            log.error(
+                "canary.unexpected_error",
+                platform=platform,
+                error=type(exc).__name__,
+                exc_info=True,
+            )
         return await _record_failure(platform, str(reason or type(exc).__name__))
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
