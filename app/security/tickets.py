@@ -133,14 +133,20 @@ def _fail(code: str, detail: str, **ctx: Any) -> NoReturn:
 
 
 def client_ip(request: Request) -> str:
-    """Best-effort real client address.
+    """Best-effort real client address, for logging and nothing else.
 
-    This value has to match, byte for byte, the address the minting route hashed
-    into the ticket. When it does not, every request 401s with ``ip_mismatch``
-    and nothing in the response says why — so the rule here is deliberately the
-    dumbest one that works everywhere, not the cleverest one.
+    This value is no longer compared against the ``ip_hash`` in the ticket.
+    Measured 2026-08-21 on a real visitor: the minting route saw 112.134.221.2
+    and this service saw 152.233.68.97, same browser, same moment, both correct
+    — a CGNAT pool egressing different connections from different addresses. The
+    comparison locked out every such visitor, so `require_ticket` now records a
+    difference and carries on. The quota key is the signed ``ip_hash`` from the
+    ticket itself.
 
-    This docstring used to argue that spoofing was self-defeating: the value
+    The rule below still matters, because the *minting* route uses the same
+    logic to decide which bucket a caller lands in, and a caller must not be
+    able to choose that. An earlier version of this docstring argued that
+    spoofing was self-defeating: the value
     computed here would stop matching the ``ip_hash`` in the attacker's ticket,
     so the request would 401. That is true of an attacker who spoofs one side.
     It is false of one who spoofs both, which is the whole attack — present the
@@ -335,27 +341,40 @@ async def verify_ticket(raw: str | None, peer_ip: str) -> TicketClaims:
         log.error("ticket_ttl_implausible", extra={"exp": claims.exp, "now": now})
         _fail("ticket_expired", "Ticket expired. Please retry.", reason="ttl_too_long")
 
-    expected_ip_hash = hash_ip(peer_ip)
-    if not hmac.compare_digest(claims.ip_hash, expected_ip_hash):
-        # Checked BEFORE the burn on purpose.  If the jti were consumed first,
-        # anyone who observed a ticket in flight could invalidate it from their
-        # own machine and deny service to the legitimate holder - a griefing
-        # primitive handed out for free.  Failing here leaves the real user's
-        # ticket untouched and still usable.
-        # `peer_ip` is logged in the clear, and only on this branch. Two salted
-        # digests that differ tell you nothing about *why* they differ, and that
-        # is precisely the failure this service is hardest to debug from the
-        # outside: the response says `ticket_bad_signature` whether the secret is
-        # wrong or the address is, and a wrong address here means the service is
-        # 100% broken for every visitor. One address, on a path that only runs
-        # when something is already misconfigured, is worth that.
-        _fail(
-            "ticket_bad_signature",
-            "Invalid ticket.",
-            reason="ip_mismatch",
-            claimed=claims.ip_hash,
-            observed=expected_ip_hash,
-            peer_ip=peer_ip,
+    # The address is recorded, not enforced.
+    #
+    # This used to reject when the presenting address differed from the minting
+    # one. Measured 2026-08-21 against a real visitor: the minting route saw
+    # 112.134.221.2 and this service saw 152.233.68.97 — same browser, same
+    # moment, both values correct. The ISP is CGNAT and egresses different
+    # connections from different addresses in a pool, so there is no single
+    # "the visitor's address" for the two services to agree on. Every such
+    # visitor was locked out of the tool completely, and no choice of
+    # X-Forwarded-For rule can fix it because neither side was wrong.
+    #
+    # What the check bought: "whoever presents this ticket is where it was
+    # minted." What survives without it: the ticket is HMAC-signed, single use
+    # (the jti burn below), lives 120 seconds, and is only issued after a
+    # Turnstile solve. Using one from elsewhere means intercepting it in flight
+    # and beating the legitimate holder inside that window, which needs MITM or
+    # XSS — and anyone holding those has better things to attack.
+    #
+    # `claims.ip_hash` remains the quota key, and it is trustworthy for that:
+    # it is inside the signature, so a caller cannot choose their own bucket,
+    # and the minting route no longer believes a caller-supplied
+    # CF-Connecting-IP (see app/security/origin.py).
+    observed_ip_hash = hash_ip(peer_ip)
+    if not hmac.compare_digest(claims.ip_hash, observed_ip_hash):
+        # Worth seeing in the logs — a sudden flood of these on a network that
+        # used to be quiet is a signal, and it is how the CGNAT case above was
+        # identified in the first place.
+        log.info(
+            "ticket_ip_moved",
+            extra={
+                "claimed": claims.ip_hash,
+                "observed": observed_ip_hash,
+                "peer_ip": peer_ip,
+            },
         )
 
     await _burn(claims.jti)

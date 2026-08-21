@@ -99,6 +99,11 @@ def normalise_ip(ip: str) -> str:
     produce the same split in production, where the symptom would be a service
     that is 100% broken with a 401 that says nothing useful.
 
+    Since 2026-08-21 a differing address no longer rejects the ticket, so that
+    particular symptom is gone — but this function matters just as much. The
+    digest is the quota key, so two spellings of one visitor is two daily
+    allowances instead of one.
+
     The rules must stay byte-identical to ``clientIp``/``hashIp`` in
     ``src/app/api/tools/download-ticket/route.ts``:
       - trim, lowercase
