@@ -266,54 +266,58 @@ async def test_wrong_audience_rejected() -> None:
     await assert_api_error("ticket_wrong_audience", tickets.require_ticket(make_request(ticket)))
 
 
-async def test_ip_hash_mismatch_rejected() -> None:
-    """A ticket lifted off the wire is useless from a different address."""
-    ticket = tickets.mint_ticket(CLIENT_IP)
-    await assert_api_error(
-        "ticket_bad_signature",
-        tickets.require_ticket(make_request(ticket, ip=OTHER_IP)),
-    )
+async def test_a_ticket_presented_from_another_address_is_accepted() -> None:
+    """Because "another address" is routinely the same person.
 
+    This asserted rejection until 2026-08-21, when a real visitor was measured
+    minting from 112.134.221.2 and presenting from 152.233.68.97 — same browser,
+    same moment, both addresses correct. Their ISP is CGNAT and egresses
+    different connections from different addresses in a pool, so there is no one
+    address for the two services to agree on, and the check locked such visitors
+    out of the tool entirely.
 
-async def test_ip_mismatch_does_not_burn_the_ticket() -> None:
-    """Otherwise an eavesdropper could invalidate other people's tickets."""
-    ticket = tickets.mint_ticket(CLIENT_IP)
-
-    await assert_api_error(
-        "ticket_bad_signature",
-        tickets.require_ticket(make_request(ticket, ip=OTHER_IP)),
-    )
-    claims = await tickets.require_ticket(make_request(ticket, ip=CLIENT_IP))
-    assert claims.ip_hash == hash_ip(CLIENT_IP)
-
-
-async def test_leftmost_forwarded_for_entry_is_the_client() -> None:
-    """The first X-Forwarded-For entry wins, matching what the minter reads.
-
-    This replaced a rightmost-Nth-hop rule that had to know how many proxies sat
-    in front. That count is a property of the deployment, not of the code — 1 on
-    a bare Railway domain, 2 behind Cloudflare — and every wrong guess presented
-    identically: `ip_mismatch`, a 401, no clue why.
-
-    Spoofing the header is not a way around the quotas. Every limit is keyed off
-    `claims.ip_hash`, which comes out of the HMAC-signed ticket rather than out
-    of this header (see `consume_resolve_quota` / `consume_bytes_quota` call
-    sites). Forging an address here only makes the check below fail, so it costs
-    the attacker their own ticket and gains them nothing.
+    What still stops a lifted ticket: it is single use (burned below), lives 120
+    seconds, and is only minted after a Turnstile solve. Using someone else's
+    means intercepting it in flight and beating them inside that window.
     """
     ticket = tickets.mint_ticket(CLIENT_IP)
-    request = make_request(ticket, ip=f"{CLIENT_IP}, 10.0.0.7")
+    claims = await tickets.require_ticket(make_request(ticket, ip=OTHER_IP))
 
-    claims = await tickets.require_ticket(request)
+    # The quota key comes out of the signed ticket, not out of the connection,
+    # so the caller still lands in the bucket the minting route chose for them.
     assert claims.ip_hash == hash_ip(CLIENT_IP)
 
 
-async def test_forged_forwarded_for_fails_rather_than_bypassing_the_binding() -> None:
-    """A client-chosen address does not silently become the trusted one."""
+async def test_a_ticket_is_still_single_use_across_addresses() -> None:
+    """Dropping the address check must not weaken the burn."""
     ticket = tickets.mint_ticket(CLIENT_IP)
-    request = make_request(ticket, ip=f"1.2.3.4, {CLIENT_IP}")
+    await tickets.require_ticket(make_request(ticket, ip=OTHER_IP))
 
-    await assert_api_error("ticket_bad_signature", tickets.require_ticket(request))
+    await assert_api_error(
+        "ticket_replayed",
+        tickets.require_ticket(make_request(ticket, ip=CLIENT_IP)),
+    )
+
+
+def test_client_ip_takes_the_rightmost_forwarded_entry() -> None:
+    """The last entry is what the proxy in front observed.
+
+    Tested directly rather than through `require_ticket`, which no longer
+    compares addresses — routing it through there would assert nothing.
+
+    This rule still matters even though the service does not enforce a match:
+    the minting route derives the quota bucket the same way, and a caller must
+    not be able to pick their own.
+    """
+    assert tickets.client_ip(make_request("x", ip=f"1.2.3.4, {CLIENT_IP}")) == CLIENT_IP
+
+
+def test_a_caller_cannot_choose_their_address_with_a_forged_leftmost() -> None:
+    """The leftmost entry is whatever the caller claimed, so it must not win."""
+    chosen = "198.51.100.7"
+    observed = tickets.client_ip(make_request("x", ip=f"{chosen}, {CLIENT_IP}"))
+    assert observed != chosen
+    assert observed == CLIENT_IP
 
 
 async def test_ticket_from_a_different_secret_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
