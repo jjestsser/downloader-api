@@ -27,7 +27,11 @@ from app.models import JobCreateRequest, JobStatus, TicketClaims
 from app.resolver import canary, platforms
 from app.resolver.ytdlp import url_hash
 from app.security.origin import require_edge
-from app.security.quotas import check_killswitch, consume_resolve_quota
+from app.security.quotas import (
+    assert_bytes_budget_available,
+    check_killswitch,
+    consume_resolve_quota,
+)
 from app.security.tickets import require_ticket
 from app.security.turnstile import verify_turnstile
 from app.settings import settings

@@ -168,35 +168,37 @@ def client_ip(request: Request) -> str:
         if cf_ip:
             return cf_ip
 
-    # RIGHTMOST X-Forwarded-For entry. Still not a counted-from-the-right one.
+    # LEFTMOST X-Forwarded-For entry.
     #
-    # Counting hops requires knowing exactly how many proxies sit in front, and
-    # that number is a property of the deployment, not of the code — every wrong
-    # guess presents identically as a 401 with no clue why. So this is not that:
-    # it is the last entry, whatever the length.
+    # MEASURED 2026-08-21, from this service's own forwarding_topology log on a
+    # real request:
     #
-    # Why the last and not the first. If the platform in front replaces this
-    # header, the list is one entry and the two ends are the same value, which is
-    # the case here and is what makes the current deployment work either way. If
-    # it ever appends instead, the first entry is whatever the caller claimed and
-    # the last is what the platform itself observed. Only one of those is worth
-    # binding a quota to, and choosing it costs nothing while the lists are short.
+    #   xff        = "112.134.221.2, 152.233.68.97"
+    #   x_real_ip  = "112.134.221.2"
+    #   peer       = "112.134.221.2"
     #
-    # `clientIpFrom` in src/lib/tools/download/ticket.ts says the same. The two
-    # disagreed until 2026-08-21 — this side took the first, that side took the
-    # last — and agreed in practice only by the coincidence described above.
+    # Railway APPENDS its own proxy address, so the last entry is Railway, not
+    # the visitor. The first entry is the client and agrees with `x-real-ip` and
+    # with what the minting route derives.
     #
-    # Spoofing is handled by the platform, not by arithmetic here: uvicorn runs
-    # with `--proxy-headers --forwarded-allow-ips='*'` (see the Procfile), which
-    # is only safe because nothing but Railway's own proxy can reach this port —
-    # a client-supplied X-Forwarded-For is replaced by the edge, not appended to.
-    # That replacement is what the measurement above confirmed: the same attack
-    # that succeeded through CF-Connecting-IP failed through this header.
+    # This was briefly changed to the rightmost entry on the theory that the
+    # leftmost is caller-controlled and therefore unsafe. That is the correct
+    # rule for the open internet and the wrong one here, and the cost of getting
+    # it wrong was total: every ticket's ip_hash stopped matching, the tool
+    # failed for everyone, and the mismatch looked so much like two genuinely
+    # different addresses that it was misread as a CGNAT pool. It was not.
+    #
+    # The leftmost entry is not attacker-controlled on this deployment: uvicorn
+    # runs with `--proxy-headers --forwarded-allow-ips='*'` behind Railway's
+    # proxy, which REPLACES a caller-supplied header rather than appending to
+    # it. Measured the same day: a forged `X-Forwarded-For` did not survive to
+    # this function, while a forged `CF-Connecting-IP` did — which is why that
+    # one is now gated on edge proof and this one is not.
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
         entries = [part.strip() for part in forwarded.split(",") if part.strip()]
         if entries:
-            return entries[-1]
+            return entries[0]
 
     real_ip = request.headers.get("x-real-ip", "").strip()
     if real_ip:
