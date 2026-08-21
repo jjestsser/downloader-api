@@ -182,14 +182,44 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
 
 
 async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Last line of defence: log the traceback, tell the client nothing."""
+    """Last line of defence: log the traceback, tell the client nothing.
+
+    The response carries CORS headers, which it has to add for itself.
+
+    Starlette runs this handler inside `ServerErrorMiddleware`, which sits
+    *outside* every user middleware — CORSMiddleware included. So a 500 from
+    here reached the browser with no `Access-Control-Allow-Origin`, the browser
+    refused to expose it to script, and `fetch` rejected with a bare network
+    error. The client could not tell a crashed request from an unplugged cable,
+    and rendered "the downloader could not be reached" over a service that was
+    up and answering.
+
+    That cost real debugging time: job creation was failing with a genuine
+    exception, logged here in full, while the page blamed the network.
+    `ApiError` responses never had this problem — they are raised inside the
+    stack and CORSMiddleware decorates them on the way out.
+
+    The origin is echoed only when it is one we already allow, so this adds no
+    permission CORSMiddleware would not have granted.
+    """
     log.error(
         "unhandled_exception",
         route=getattr(getattr(request, "scope", {}).get("route", None), "path", request.url.path),
         request_id=getattr(request.state, "request_id", None),
         exc_info=True,
     )
-    return JSONResponse(status_code=500, content={"error": "internal", "detail": "Something went wrong on our side."})
+
+    headers: dict[str, str] = {}
+    origin = request.headers.get("origin", "")
+    if origin and origin in settings.cors_origins:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
+
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal", "detail": "Something went wrong on our side."},
+        headers=headers,
+    )
 
 
 # --------------------------------------------------------------------------- #
